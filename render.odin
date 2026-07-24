@@ -17,6 +17,34 @@ BODY_C     :: rl.Color{226, 88, 58, 255}
 SKIN_C     :: rl.Color{243, 204, 168, 255}
 LIMB_C     :: rl.Color{62, 44, 40, 255}
 
+// --- Skins ---------------------------------------------------------------
+
+Hat_Kind :: enum {
+	None,
+	Headband,
+	Cap,
+	Crown,
+	Hood,
+}
+
+Skin_Def :: struct {
+	name:   cstring,
+	body:   rl.Color, // shirt / torso
+	limb:   rl.Color, // pants / hood
+	skin:   rl.Color, // head / hands
+	accent: rl.Color, // hat, sash, boots
+	hat:    Hat_Kind,
+	unlock: int, // lifetime banked coins needed
+}
+
+SKINS := [?]Skin_Def{
+	{"SCOUT",    BODY_C,              LIMB_C,             SKIN_C,               {255, 200, 40, 255},  .Headband, 0},
+	{"JADE",     {52, 158, 106, 255}, {30, 62, 48, 255},  {236, 196, 152, 255}, {214, 240, 110, 255}, .Hood,     25},
+	{"MIDNIGHT", {64, 66, 128, 255},  {30, 28, 56, 255},  {214, 192, 224, 255}, {140, 200, 255, 255}, .Cap,      75},
+	{"GILDED",   {234, 180, 52, 255}, {122, 86, 30, 255}, {243, 204, 168, 255}, {255, 244, 170, 255}, .Crown,    150},
+	{"EMBER",    {206, 54, 38, 255},  {56, 24, 22, 255},  {255, 214, 170, 255}, {255, 140, 40, 255},  .Hood,     250},
+}
+
 MAX_LIGHTS    :: 16
 MAX_PARTICLES :: 512
 STAR_COUNT    :: 140
@@ -164,6 +192,7 @@ Renderer :: struct {
 	mesh_sphere: rl.Mesh,
 	mesh_cyl:    rl.Mesh,
 	mesh_plane:  rl.Mesh,
+	mesh_torus:  rl.Mesh,
 
 	tex_floor: rl.Texture2D,
 	tex_brick: rl.Texture2D,
@@ -522,6 +551,7 @@ init_renderer :: proc() {
 	rd.mesh_sphere = rl.GenMeshSphere(1, 12, 18)
 	rd.mesh_cyl = rl.GenMeshCylinder(1, 1, 20)
 	rd.mesh_plane = rl.GenMeshPlane(1, 1, 1, 1)
+	rd.mesh_torus = rl.GenMeshTorus(0.44, 0.16, 18, 14)
 
 	rd.tex_floor = make_floor_texture()
 	rd.tex_brick = make_brick_texture()
@@ -555,6 +585,7 @@ shutdown_renderer :: proc() {
 	rl.UnloadMesh(rd.mesh_sphere)
 	rl.UnloadMesh(rd.mesh_cyl)
 	rl.UnloadMesh(rd.mesh_plane)
+	rl.UnloadMesh(rd.mesh_torus)
 	rl.UnloadTexture(rd.tex_floor)
 	rl.UnloadTexture(rd.tex_brick)
 	rl.UnloadTexture(rd.tex_stone)
@@ -664,6 +695,44 @@ spawn_death_burst :: proc(pos: rl.Vector3) {
 			col = {255, 130, 50, 255},
 			grav = -6.0,
 			additive = true,
+		})
+	}
+}
+
+spawn_pickup_burst :: proc(pos: rl.Vector3, col: rl.Color) {
+	for _ in 0 ..< 16 {
+		spawn_particle(Particle{
+			pos = pos,
+			vel = {(rand.float32() - 0.5)*5.0, (rand.float32() - 0.1)*4.5, (rand.float32() - 0.5)*4.0},
+			ttl = 0.4 + rand.float32()*0.35,
+			size = 0.22 + rand.float32()*0.16,
+			col = col,
+			grav = -4.0,
+			additive = true,
+		})
+	}
+}
+
+spawn_shield_break :: proc(pos: rl.Vector3) {
+	for _ in 0 ..< 12 {
+		spawn_particle(Particle{
+			pos = pos,
+			vel = {(rand.float32() - 0.5)*8.0, rand.float32()*5.0, (rand.float32() - 0.2)*7.0},
+			ttl = 0.45 + rand.float32()*0.4,
+			size = 0.26 + rand.float32()*0.22,
+			col = {90, 200, 255, 255},
+			grav = -5.0,
+			additive = true,
+		})
+	}
+	for _ in 0 ..< 8 {
+		spawn_particle(Particle{
+			pos = pos,
+			vel = {(rand.float32() - 0.5)*6.0, rand.float32()*4.5, (rand.float32() - 0.3)*5.0},
+			ttl = 0.5 + rand.float32()*0.4,
+			size = 0.24 + rand.float32()*0.2,
+			col = {120, 104, 90, 255},
+			grav = -8.0,
 		})
 	}
 }
@@ -817,63 +886,249 @@ draw_obstacle :: proc(ob: Obstacle) {
 }
 
 draw_coin_mesh :: proc(g: ^Game, c: Coin) {
-	x := f32(c.lane)*LANE_WIDTH
-	y := 1.0 + math.sin(g.time*4 + c.z*0.5)*0.12
+	y := c.pulled ? c.y : (1.0 + math.sin(g.time*4 + c.z*0.5)*0.12)
 	spin := g.time*3.5 + c.z*0.7
 	rd.mat_gold.maps[0].color = GOLD
-	m := mat_translate(x, y, c.z)*mat_rot_y(spin)*mat_rot_x(math.PI/2)*mat_scale(0.34, 0.10, 0.34)*mat_translate(0, -0.5, 0)
+	m := mat_translate(c.x, y, c.z)*mat_rot_y(spin)*mat_rot_x(math.PI/2)*mat_scale(0.34, 0.10, 0.34)*mat_translate(0, -0.5, 0)
 	rl.DrawMesh(rd.mesh_cyl, rd.mat_gold, m)
 }
 
 draw_coin_glows :: proc(g: ^Game) {
 	rl.BeginBlendMode(.ADDITIVE)
 	for c in g.coins {
-		x := f32(c.lane)*LANE_WIDTH
-		y := 1.0 + math.sin(g.time*4 + c.z*0.5)*0.12
+		y := c.pulled ? c.y : (1.0 + math.sin(g.time*4 + c.z*0.5)*0.12)
 		pulse := 0.75 + 0.25*math.sin(g.time*6 + c.z)
-		rl.DrawBillboard(rd.cam, rd.tex_glow, {x, y, c.z}, 0.85*pulse, rl.Fade({255, 190, 60, 255}, 0.22*pulse))
+		rl.DrawBillboard(rd.cam, rd.tex_glow, {c.x, y, c.z}, 0.85*pulse, rl.Fade({255, 190, 60, 255}, 0.22*pulse))
 	}
 	rl.EndBlendMode()
 }
 
+// --- Powerups -----------------------------------------------------------
+
+powerup_color :: proc(k: Powerup_Kind) -> rl.Color {
+	switch k {
+	case .Magnet:
+		return {255, 110, 90, 255}
+	case .Shield:
+		return {90, 200, 255, 255}
+	case .Doubler:
+		return {255, 210, 80, 255}
+	}
+	return rl.WHITE
+}
+
+draw_powerup :: proc(g: ^Game, pu: Powerup) {
+	x := f32(pu.lane)*LANE_WIDTH
+	y := 1.25 + math.sin(g.time*3.1 + pu.z*0.4)*0.14
+	spin := g.time*2.4
+	col := powerup_color(pu.kind)
+	m := mat_translate(x, y, pu.z)*mat_rot_y(spin)
+	switch pu.kind {
+	case .Magnet:
+		rd.mat_flat.maps[0].color = col
+		rl.DrawMesh(rd.mesh_torus, rd.mat_flat, m*mat_rot_x(math.PI/2))
+		rd.mat_flat.maps[0].color = rl.RAYWHITE
+		rl.DrawMesh(rd.mesh_cube, rd.mat_flat, m*mat_ts({0, 0.34, 0}, {0.16, 0.14, 0.16}))
+	case .Shield:
+		rd.mat_flat.maps[0].color = {200, 236, 255, 255}
+		rl.DrawMesh(rd.mesh_sphere, rd.mat_flat, m*mat_scale(0.17, 0.17, 0.17))
+		rd.mat_flat.maps[0].color = col
+		rl.DrawMesh(rd.mesh_torus, rd.mat_flat, m*mat_rot_z(0.6))
+	case .Doubler:
+		rd.mat_gold.maps[0].color = GOLD
+		rl.DrawMesh(rd.mesh_cube, rd.mat_gold, m*mat_rot_z(0.785)*mat_scale(0.30, 0.30, 0.30))
+		rd.mat_flat.maps[0].color = {255, 244, 170, 255}
+		rl.DrawMesh(rd.mesh_cube, rd.mat_flat, m*mat_rot_x(0.785)*mat_scale(0.20, 0.20, 0.20))
+	}
+}
+
+draw_powerup_glows :: proc(g: ^Game) {
+	rl.BeginBlendMode(.ADDITIVE)
+	for pu in g.powerups {
+		x := f32(pu.lane)*LANE_WIDTH
+		y := 1.25 + math.sin(g.time*3.1 + pu.z*0.4)*0.14
+		pulse := 0.8 + 0.2*math.sin(g.time*5 + pu.z)
+		rl.DrawBillboard(rd.cam, rd.tex_glow, {x, y, pu.z}, 1.8*pulse, rl.Fade(powerup_color(pu.kind), 0.45*pulse))
+	}
+	rl.EndBlendMode()
+}
+
+// segment lengths for the articulated runner
+THIGH_LEN :: f32(0.42)
+SHIN_LEN  :: f32(0.40)
+UARM_LEN  :: f32(0.33)
+FARM_LEN  :: f32(0.31)
+
+mix_c :: proc(a, b: rl.Color, t: f32) -> rl.Color {
+	return {
+		u8(f32(a.r) + (f32(b.r) - f32(a.r))*t),
+		u8(f32(a.g) + (f32(b.g) - f32(a.g))*t),
+		u8(f32(a.b) + (f32(b.b) - f32(a.b))*t),
+		a.a,
+	}
+}
+
+// box/sphere part in `base` space
+player_part :: proc(mesh: rl.Mesh, base: rl.Matrix, off, size: rl.Vector3, tint: rl.Color) {
+	rd.mat_flat.maps[0].color = tint
+	rl.DrawMesh(mesh, rd.mat_flat, base*mat_ts(off, size))
+}
+
+// box segment hanging down from a joint
+player_seg :: proc(joint: rl.Matrix, length, thick: f32, tint: rl.Color) {
+	player_part(rd.mesh_cube, joint, {0, -length*0.5, 0}, {thick, length, thick}, tint)
+}
+
+player_leg :: proc(base: rl.Matrix, x, hip_y, hip, knee: f32, pants, boot: rl.Color) {
+	hip_m := base*mat_translate(x, hip_y, 0)*mat_rot_x(hip)
+	player_seg(hip_m, THIGH_LEN, 0.21, pants)
+	knee_m := hip_m*mat_translate(0, -THIGH_LEN, 0)*mat_rot_x(knee)
+	player_seg(knee_m, SHIN_LEN, 0.17, pants)
+	player_part(rd.mesh_cube, knee_m*mat_translate(0, -SHIN_LEN, 0), {0, 0.05, -0.07}, {0.19, 0.11, 0.30}, boot)
+}
+
+player_arm :: proc(torso_m: rl.Matrix, x, sh, el: f32, sleeve, hand: rl.Color) {
+	out: f32 = x < 0 ? -0.10 : 0.10
+	sh_m := torso_m*mat_translate(x, 0.58, 0)*mat_rot_z(out)*mat_rot_x(sh)
+	player_seg(sh_m, UARM_LEN, 0.14, sleeve)
+	el_m := sh_m*mat_translate(0, -UARM_LEN, 0)*mat_rot_x(el)
+	player_seg(el_m, FARM_LEN, 0.115, hand)
+	player_part(rd.mesh_cube, el_m*mat_translate(0, -FARM_LEN, 0), {0, -0.03, 0}, {0.13, 0.13, 0.13}, hand)
+}
+
 draw_player :: proc(g: ^Game) {
 	p := g.player
+	sk := SKINS[g.skin]
 	grounded := p.y <= 0.01
 	phase := g.distance*2.2
+	speed_n := clamp((g.speed - BASE_SPEED)/(MAX_SPEED - BASE_SPEED), 0, 1)
 
 	bob: f32
-	if grounded && !p.sliding && g.state == .Playing do bob = abs(math.sin(phase))*0.1
+	if grounded && !p.sliding && g.state == .Playing do bob = abs(math.sin(phase))*0.09
 	y := p.y + bob
 
-	body := g.state == .Dead ? rl.Color{205, 60, 48, 255} : BODY_C
+	dead := g.state == .Dead
+	body := dead ? mix_c(sk.body, {205, 60, 48, 255}, 0.65) : sk.body
+	pants := dead ? mix_c(sk.limb, {120, 40, 34, 255}, 0.5) : sk.limb
+	flesh := dead ? mix_c(sk.skin, {220, 120, 100, 255}, 0.4) : sk.skin
+	accent := sk.accent
 
 	// soft blob shadow
 	ss := clamp(0.95/(1 + p.y*0.35), 0.3, 1.0)
 	rd.mat_shadow.maps[0].color = {0, 0, 0, u8(150.0*ss)}
 	rl.DrawMesh(rd.mesh_plane, rd.mat_shadow, mat_translate(p.x, 0.02, 0)*mat_scale(1.5*ss + 0.4, 1, 1.2*ss + 0.3))
 
-	// lean into lane changes, slight forward tilt in the air
+	// lean into lane changes, slight tilt in the air
 	lean := clamp((f32(p.lane)*LANE_WIDTH - p.x)*-0.14, -0.4, 0.4)
 	tilt: f32 = grounded ? 0 : clamp(-p.vy*0.02, -0.25, 0.35)
 	base := mat_translate(p.x, y, 0)*mat_rot_z(lean)*mat_rot_x(tilt)
+	if g.state == .Menu do base = base*mat_rot_y(math.PI + g.time*0.9)    // skin-select turntable
+	if dead do base = base*mat_rot_x(clamp(g.death_timer*3.2, 0, 1.45)) // face-plant
 
-	part :: proc(mesh: rl.Mesh, m: ^rl.Material, base: rl.Matrix, off, size: rl.Vector3, tint: rl.Color) {
-		m.maps[0].color = tint
-		rl.DrawMesh(mesh, m^, base*mat_ts(off, size))
-	}
+	// --- pose --------------------------------------------------------
+	hip_l, knee_l, hip_r, knee_r: f32
+	sh_l, el_l, sh_r, el_r: f32
+	twist, tlean: f32
+	pelvis_y := f32(0.86)
 
 	if p.sliding {
-		part(rd.mesh_cube, &rd.mat_flat, base, {0, 0.30, 0.1}, {0.8, 0.5, 1.0}, body)
-		part(rd.mesh_sphere, &rd.mat_flat, base, {0, 0.62, -0.45}, {0.22, 0.22, 0.22}, SKIN_C)
+		pelvis_y = 0.34
+		tlean = -1.15 // recline for the baseball slide
+		hip_l, knee_l = 1.35, -0.20
+		hip_r, knee_r = 1.05, -0.85
+		sh_l, el_l = -1.9, 0.4
+		sh_r, el_r = 0.9, 1.2
+		twist = 0.15
+	} else if !grounded {
+		tuck := clamp(p.vy*0.05 + 0.55, 0, 1) // rising -> tucked, falling -> extended
+		hip_l = 0.45 + 1.05*tuck
+		knee_l = -(0.45 + 1.45*tuck)
+		hip_r = -0.15 + 0.55*tuck
+		knee_r = -(0.55 + 0.75*tuck)
+		sh_l = -0.2 - 0.9*tuck
+		el_l = 0.9
+		sh_r = 0.3 + 0.7*tuck
+		el_r = 1.3
+		tlean = 0.10
+	} else if g.state == .Menu {
+		hip_l, knee_l = 0.04, -0.10
+		hip_r, knee_r = -0.04, -0.10
+		sh_l, el_l = 0.06, 0.25
+		sh_r, el_r = -0.06, 0.25
+		tlean = 0.03 + math.sin(g.time*2.4)*0.03 // breathing
 	} else {
-		lo := grounded ? math.sin(phase)*0.28 : 0.22
-		part(rd.mesh_cube, &rd.mat_flat, base, {-0.18, 0.35, lo}, {0.22, 0.7, 0.22}, LIMB_C)
-		part(rd.mesh_cube, &rd.mat_flat, base, {+0.18, 0.35, -lo}, {0.22, 0.7, 0.22}, LIMB_C)
-		part(rd.mesh_cube, &rd.mat_flat, base, {0, 1.10, 0}, {0.72, 0.8, 0.45}, body)
-		part(rd.mesh_cube, &rd.mat_flat, base, {-0.46, 1.15, -lo*0.8}, {0.16, 0.55, 0.16}, SKIN_C)
-		part(rd.mesh_cube, &rd.mat_flat, base, {+0.46, 1.15, lo*0.8}, {0.16, 0.55, 0.16}, SKIN_C)
-		part(rd.mesh_sphere, &rd.mat_flat, base, {0, 1.68, 0}, {0.23, 0.23, 0.23}, SKIN_C)
+		hip_l = math.sin(phase)*0.85
+		hip_r = -hip_l
+		knee_l = -(0.15 + 1.55*max(math.cos(phase - 4.9), 0))
+		knee_r = -(0.15 + 1.55*max(math.cos(phase + math.PI - 4.9), 0))
+		sh_l = -math.sin(phase)*0.75
+		sh_r = -sh_l
+		el_l = 1.05 + 0.25*clamp(-math.sin(phase), 0, 1)
+		el_r = 1.05 + 0.25*clamp(math.sin(phase), 0, 1)
+		twist = math.sin(phase)*0.13
+		tlean = 0.14 + 0.10*speed_n
 	}
+
+	// --- build ---------------------------------------------------------
+	player_part(rd.mesh_cube, base, {0, pelvis_y - 0.02, 0}, {0.46, 0.24, 0.32}, pants)
+	player_leg(base, -0.15, pelvis_y - 0.10, hip_l, knee_l, pants, accent)
+	player_leg(base, +0.15, pelvis_y - 0.10, hip_r, knee_r, pants, accent)
+
+	torso_m := base*mat_translate(0, pelvis_y + 0.06, 0)*mat_rot_y(twist)*mat_rot_x(tlean)
+	player_part(rd.mesh_cube, torso_m, {0, 0.32, 0}, {0.56, 0.60, 0.34}, body)
+	player_part(rd.mesh_cube, torso_m, {0, 0.34, -0.185}, {0.42, 0.14, 0.02}, accent) // chest sash
+
+	player_arm(torso_m, -0.36, sh_l, el_l, body, flesh)
+	player_arm(torso_m, +0.36, sh_r, el_r, body, flesh)
+
+	// --- head & hat ------------------------------------------------------
+	head_m := torso_m*mat_translate(0, 0.62, 0)*mat_rot_x(-tlean*0.6)
+	head_z: f32 = sk.hat == .Hood ? -0.05 : 0
+	player_part(rd.mesh_sphere, head_m, {0, 0.16, head_z}, {0.22, 0.24, 0.22}, flesh)
+	eye := rl.Color{34, 28, 32, 255}
+	player_part(rd.mesh_cube, head_m, {-0.08, 0.19, head_z - 0.185}, {0.05, 0.05, 0.03}, eye)
+	player_part(rd.mesh_cube, head_m, {+0.08, 0.19, head_z - 0.185}, {0.05, 0.05, 0.03}, eye)
+
+	switch sk.hat {
+	case .None:
+	case .Headband:
+		rd.mat_flat.maps[0].color = accent
+		rl.DrawMesh(rd.mesh_cyl, rd.mat_flat, head_m*mat_translate(0, 0.22, 0)*mat_scale(0.235, 0.08, 0.235)*mat_translate(0, -0.5, 0))
+	case .Cap:
+		player_part(rd.mesh_sphere, head_m, {0, 0.31, 0.02}, {0.225, 0.13, 0.225}, accent)
+		player_part(rd.mesh_cube, head_m, {0, 0.28, -0.27}, {0.30, 0.045, 0.24}, accent)
+	case .Crown:
+		rd.mat_flat.maps[0].color = accent
+		rl.DrawMesh(rd.mesh_cyl, rd.mat_flat, head_m*mat_translate(0, 0.40, 0)*mat_scale(0.185, 0.12, 0.185)*mat_translate(0, -0.5, 0))
+		player_part(rd.mesh_cube, head_m, {0, 0.46, -0.16}, {0.055, 0.10, 0.055}, accent)
+		player_part(rd.mesh_cube, head_m, {-0.14, 0.46, 0.08}, {0.055, 0.10, 0.055}, accent)
+		player_part(rd.mesh_cube, head_m, {+0.14, 0.46, 0.08}, {0.055, 0.10, 0.055}, accent)
+	case .Hood:
+		player_part(rd.mesh_sphere, head_m, {0, 0.17, 0.05}, {0.26, 0.27, 0.26}, pants)
+		player_part(rd.mesh_cube, head_m, {0, -0.06, 0.02}, {0.34, 0.16, 0.30}, pants) // cowl
+	}
+}
+
+// powerup auras around the runner
+draw_player_aura :: proc(g: ^Game) {
+	if g.state != .Playing do return
+	p := g.player
+	rl.BeginBlendMode(.ADDITIVE)
+	if g.shield_t > 0 {
+		blink: f32 = g.shield_t < 2.5 && math.mod(g.time, 0.3) < 0.15 ? 0.3 : 1.0
+		pulse := 1.0 + 0.06*math.sin(g.time*9)
+		rl.DrawBillboard(rd.cam, rd.tex_glow, {p.x, p.y + 1.0, 0}, 2.6*pulse, rl.Fade({90, 200, 255, 255}, 0.45*blink))
+	}
+	if g.magnet_t > 0 {
+		a := g.time*7
+		rl.DrawBillboard(rd.cam, rd.tex_glow, {p.x + math.cos(a)*0.9, p.y + 1.0 + math.sin(a*1.3)*0.5, 0.2}, 0.5, rl.Fade({255, 110, 90, 255}, 0.5))
+		rl.DrawBillboard(rd.cam, rd.tex_glow, {p.x - math.cos(a)*0.9, p.y + 1.0 - math.sin(a*1.3)*0.5, 0.2}, 0.5, rl.Fade({255, 160, 90, 255}, 0.5))
+	}
+	if g.double_t > 0 {
+		pulse := 0.8 + 0.2*math.sin(g.time*11)
+		rl.DrawBillboard(rd.cam, rd.tex_glow, {p.x, p.y + 2.2, 0}, 0.65*pulse, rl.Fade(GOLD, 0.5))
+	}
+	rl.EndBlendMode()
 }
 
 // --- Per-frame visual effects driven by gameplay ------------------------------------
@@ -919,9 +1174,12 @@ draw_world :: proc(g: ^Game) {
 	draw_torches(g)
 	for ob in g.obstacles do draw_obstacle(ob)
 	for c in g.coins do draw_coin_mesh(g, c)
+	for pu in g.powerups do draw_powerup(g, pu)
 	draw_player(g)
 	draw_particles()
 	draw_coin_glows(g)
+	draw_powerup_glows(g)
+	draw_player_aura(g)
 	draw_torch_glows()
 	rl.EndMode3D()
 	rl.EndTextureMode()
