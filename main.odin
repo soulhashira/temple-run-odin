@@ -3,7 +3,8 @@
 //
 // Controls: A/D or arrows = switch lane, SPACE/W/UP = jump,
 //           S/DOWN = slide (in air: slam down), P = pause, ESC = quit.
-// Menu: LEFT/RIGHT browse runner skins (unlocked with banked coins).
+// Menu: LEFT/RIGHT browse runner skins (unlocked with banked coins),
+//       UP/DOWN switch course (Midnight Ruins / Jungle Temple).
 package temple_run
 
 import "core:fmt"
@@ -47,6 +48,28 @@ Game_State :: enum {
 	Menu,
 	Playing,
 	Dead,
+}
+
+Course :: enum {
+	Ruins,   // the original nighttime course
+	Classic, // daylight jungle temple, original-recipe Temple Run
+}
+
+Course_Def :: struct {
+	name:    cstring,
+	tagline: cstring,
+	accent:  rl.Color,
+}
+
+COURSES := [Course]Course_Def{
+	.Ruins   = {"MIDNIGHT RUINS", "torchlit halls - hurdles, gates and walls", {186, 156, 255, 255}},
+	.Classic = {"JUNGLE TEMPLE", "the classic run - jump the pits", {132, 222, 120, 255}},
+}
+
+// full-width hole in the track (Classic course): jump it or fall in
+Gap :: struct {
+	z:    f32, // center
+	half: f32, // half length
 }
 
 Obstacle_Kind :: enum {
@@ -101,7 +124,7 @@ Game :: struct {
 	coin_count:  int,
 	last_row_z:  f32,
 	next_gap:    f32,
-	high_score:  int,
+	high_scores: [Course]int,
 	new_best:    bool,
 	death_timer: f32,
 	time:        f32,
@@ -114,6 +137,9 @@ Game :: struct {
 	total_coins:    int, // lifetime coin bank — unlocks skins
 	bank_at_start:  int,
 	skin:           int,
+	course:         Course,
+	gaps:           [dynamic]Gap, // Classic course: holes in the track
+	fell:           bool,         // last death was a pit fall
 }
 
 // --- Helpers -----------------------------------------------------------
@@ -157,6 +183,11 @@ rand_gap :: proc(speed: f32) -> f32 {
 // One "row" of obstacles. A randomly chosen safe lane never gets a Block,
 // so every row is survivable by construction.
 spawn_row :: proc(g: ^Game, z: f32) {
+	// Classic course: sometimes the track just... isn't there. Jump.
+	if g.course == .Classic && g.distance - z > 60 && rand.float32() < 0.22 {
+		spawn_pit(g, z)
+		return
+	}
 	safe := rand.int_max(3) - 1
 	for lane in -1 ..= 1 {
 		if lane == safe {
@@ -197,6 +228,26 @@ spawn_row :: proc(g: ^Game, z: f32) {
 	}
 }
 
+// Classic pit: full-width hole, cleared with a jump, often sweetened with a coin arc
+spawn_pit :: proc(g: ^Game, z: f32) {
+	half := 1.7 + rand.float32()*0.8
+	append(&g.gaps, Gap{z, half})
+	if rand.float32() < 0.75 {
+		lane := rand.int_max(3) - 1
+		span := half*2 + 3.6
+		N :: 7
+		for i in 0 ..< N {
+			t := f32(i)/f32(N - 1)
+			append(&g.coins, Coin{
+				lane = lane,
+				z    = z + span*0.5 - t*span,
+				x    = f32(lane)*LANE_WIDTH,
+				y    = 1.0 + math.sin(t*math.PI)*1.75, // arc peaks over the pit
+			})
+		}
+	}
+}
+
 update_spawns :: proc(g: ^Game, dt: f32) {
 	g.last_row_z += g.speed * dt
 	for {
@@ -212,9 +263,11 @@ reset_run :: proc(g: ^Game) {
 	clear(&g.obstacles)
 	clear(&g.coins)
 	clear(&g.powerups)
+	clear(&g.gaps)
 	g.player = {}
 	g.paused = false
 	g.new_best = false
+	g.fell = false
 	g.speed = BASE_SPEED
 	g.distance = 0
 	g.coin_count = 0
@@ -232,14 +285,14 @@ reset_run :: proc(g: ^Game) {
 
 // --- Update ------------------------------------------------------------
 
-update_player :: proc(g: ^Game, dt: f32) {
+update_player :: proc(g: ^Game, dt: f32, over_gap: bool) {
 	p := &g.player
 
 	if rl.IsKeyPressed(.LEFT) || rl.IsKeyPressed(.A) do p.lane = max(p.lane - 1, -1)
 	if rl.IsKeyPressed(.RIGHT) || rl.IsKeyPressed(.D) do p.lane = min(p.lane + 1, 1)
 	p.x += (f32(p.lane) * LANE_WIDTH - p.x) * min(LANE_LERP * dt, 1)
 
-	grounded := p.y <= 0.001 && p.vy <= 0
+	grounded := p.y <= 0.001 && p.vy <= 0 && !over_gap
 
 	if (rl.IsKeyPressed(.SPACE) || rl.IsKeyPressed(.UP) || rl.IsKeyPressed(.W)) && grounded {
 		p.vy = JUMP_VELOCITY
@@ -261,7 +314,7 @@ update_player :: proc(g: ^Game, dt: f32) {
 	if !grounded {
 		p.vy += GRAVITY * dt
 		p.y += p.vy * dt
-		if p.y <= 0 {
+		if p.y <= 0 && !over_gap {
 			p.y = 0
 			p.vy = 0
 			spawn_dust({p.x, 0.05, 0.2}, 6, 2.5, 0.4)
@@ -282,10 +335,11 @@ update_player :: proc(g: ^Game, dt: f32) {
 kill_player :: proc(g: ^Game) {
 	g.state = .Dead
 	g.death_timer = 0
-	spawn_death_burst({g.player.x, 1.2, 0.2})
+	spawn_death_burst({g.player.x, g.player.y + 1.2, 0.2})
 	s := score(g)
-	g.new_best = s > g.high_score && g.high_score > 0
-	if s > g.high_score do g.high_score = s
+	hs := g.high_scores[g.course]
+	g.new_best = s > hs && hs > 0
+	if s > hs do g.high_scores[g.course] = s
 }
 
 update_playing :: proc(g: ^Game, dt: f32) {
@@ -297,12 +351,37 @@ update_playing :: proc(g: ^Game, dt: f32) {
 	g.double_t = max(g.double_t - dt, 0)
 	g.invuln_t = max(g.invuln_t - dt, 0)
 
-	update_player(g, dt)
-
 	ds := g.speed * dt
+
+	// pits scroll like everything else; no floor beneath you means no jump, no landing
+	i := 0
+	for i < len(g.gaps) {
+		gp := &g.gaps[i]
+		gp.z += ds
+		if gp.z - gp.half > DESPAWN_Z {
+			unordered_remove(&g.gaps, i)
+			continue
+		}
+		i += 1
+	}
+	over_gap := false
+	for gp in g.gaps {
+		if abs(gp.z) < gp.half - 0.40 { // forgiving lip on both edges
+			over_gap = true
+			break
+		}
+	}
+
+	update_player(g, dt, over_gap)
+	if g.player.y < -1.6 {
+		g.fell = true
+		kill_player(g)
+		return
+	}
+
 	pbox := player_box(g.player)
 
-	i := 0
+	i = 0
 	for i < len(g.obstacles) {
 		ob := &g.obstacles[i]
 		ob.z += ds
@@ -347,7 +426,7 @@ update_playing :: proc(g: ^Game, dt: f32) {
 				c.y += d.y * pull
 				c.z += d.z * pull
 			}
-		} else if abs(c.z) < 0.8 && abs(c.x - g.player.x) < 0.9 {
+		} else if abs(c.z) < 0.8 && abs(c.x - g.player.x) < 0.9 && c.y > g.player.y - 0.4 && c.y < g.player.y + 2.4 {
 			collected = true
 		}
 		if collected {
@@ -408,22 +487,27 @@ draw_hud :: proc(g: ^Game) {
 	switch g.state {
 	case .Menu:
 		rl.DrawRectangle(0, 0, WIN_W, WIN_H, rl.Fade(rl.BLACK, 0.35))
-		center_text("TEMPLE RUN", 120, 84, GOLD)
-		center_text("odin + raylib", 210, 22, rl.RAYWHITE)
+		center_text("TEMPLE RUN", 96, 84, GOLD)
+		center_text("odin + raylib", 184, 22, rl.RAYWHITE)
 
 		sk := SKINS[g.skin]
-		center_text(fmt.ctprintf("<  %s  >", sk.name), 300, 36, sk.accent)
+		center_text(fmt.ctprintf("<  %s  >", sk.name), 244, 36, sk.accent)
 		if skin_unlocked(g, g.skin) {
-			center_text("LEFT / RIGHT - choose your runner", 344, 20, rl.LIGHTGRAY)
+			center_text("LEFT / RIGHT - choose your runner", 286, 20, rl.LIGHTGRAY)
 		} else {
-			center_text(fmt.ctprintf("LOCKED - bank %v coins to unlock", sk.unlock), 344, 20, rl.Color{235, 120, 90, 255})
+			center_text(fmt.ctprintf("LOCKED - bank %v coins to unlock", sk.unlock), 286, 20, rl.Color{235, 120, 90, 255})
 		}
-		center_text(fmt.ctprintf("coin bank  %v", g.total_coins), 376, 20, GOLD)
 
-		center_text("A / D - lane      SPACE / W - jump      S / DOWN - slide", 440, 22, rl.RAYWHITE)
-		center_text("MAGNET pulls coins    SHIELD eats one hit    x2 doubles coins", 472, 20, rl.Color{150, 210, 255, 255})
-		if g.high_score > 0 {
-			center_text(fmt.ctprintf("BEST  %v", g.high_score), 512, 26, GOLD)
+		co := COURSES[g.course]
+		center_text(fmt.ctprintf("^  %s  v", co.name), 330, 32, co.accent)
+		center_text(co.tagline, 368, 20, rl.LIGHTGRAY)
+		center_text("UP / DOWN - switch course", 394, 18, rl.GRAY)
+
+		center_text(fmt.ctprintf("coin bank  %v", g.total_coins), 426, 20, GOLD)
+		center_text("A / D - lane      SPACE / W - jump      S / DOWN - slide", 456, 22, rl.RAYWHITE)
+		center_text("MAGNET pulls coins    SHIELD eats one hit    x2 doubles coins", 486, 20, rl.Color{150, 210, 255, 255})
+		if g.high_scores[g.course] > 0 {
+			center_text(fmt.ctprintf("BEST  %v", g.high_scores[g.course]), 520, 26, GOLD)
 		}
 		blink := math.mod(g.time, 1.0) < 0.6
 		if blink {
@@ -440,8 +524,8 @@ draw_hud :: proc(g: ^Game) {
 		rl.DrawText(fmt.ctprintf("COINS  %v", g.coin_count), 30, 58, 22, GOLD)
 		if g.double_t > 0 do rl.DrawText("x2", 165, 58, 22, rl.Color{255, 240, 150, 255})
 		rl.DrawText(fmt.ctprintf("SPEED  %.0f", g.speed), 30, 86, 22, rl.Color{140, 200, 255, 255})
-		if g.high_score > 0 {
-			t := fmt.ctprintf("BEST  %v", g.high_score)
+		if g.high_scores[g.course] > 0 {
+			t := fmt.ctprintf("BEST  %v", g.high_scores[g.course])
 			rl.DrawText(t, WIN_W - 30 - rl.MeasureText(t, 24), 24, 24, rl.Fade(GOLD, 0.8))
 		}
 		my := i32(WIN_H - 48)
@@ -456,7 +540,7 @@ draw_hud :: proc(g: ^Game) {
 
 	case .Dead:
 		rl.DrawRectangle(0, 0, WIN_W, WIN_H, rl.Fade(rl.BLACK, 0.55))
-		center_text("YOU CRASHED", 200, 68, rl.Color{235, 80, 60, 255})
+		center_text(g.fell ? "YOU FELL" : "YOU CRASHED", 200, 68, rl.Color{235, 80, 60, 255})
 		center_text(fmt.ctprintf("SCORE  %v", score(g)), 310, 40, rl.RAYWHITE)
 		center_text(
 			fmt.ctprintf("distance %vm   +   %v coins x 10", int(g.distance), g.coin_count),
@@ -465,7 +549,7 @@ draw_hud :: proc(g: ^Game) {
 		if g.new_best {
 			center_text("NEW BEST!", 415, 30, GOLD)
 		} else {
-			center_text(fmt.ctprintf("BEST  %v", g.high_score), 415, 26, GOLD)
+			center_text(fmt.ctprintf("BEST  %v", g.high_scores[g.course]), 415, 26, GOLD)
 		}
 		center_text(fmt.ctprintf("coin bank  %v", g.total_coins), 455, 22, GOLD)
 		for s in SKINS {
@@ -498,6 +582,7 @@ main :: proc() {
 	defer delete(g.obstacles)
 	defer delete(g.coins)
 	defer delete(g.powerups)
+	defer delete(g.gaps)
 	g.state = .Menu
 	reset_run(&g)
 
@@ -511,6 +596,10 @@ main :: proc() {
 			if rl.IsKeyPressed(.ESCAPE) do quit = true
 			if rl.IsKeyPressed(.LEFT) || rl.IsKeyPressed(.A) do g.skin = (g.skin + len(SKINS) - 1) % len(SKINS)
 			if rl.IsKeyPressed(.RIGHT) || rl.IsKeyPressed(.D) do g.skin = (g.skin + 1) % len(SKINS)
+			if rl.IsKeyPressed(.UP) || rl.IsKeyPressed(.W) || rl.IsKeyPressed(.DOWN) || rl.IsKeyPressed(.S) {
+				g.course = Course((int(g.course) + 1) % len(Course))
+				reset_run(&g) // rebuild the backdrop world for the new course
+			}
 			if (rl.IsKeyPressed(.SPACE) || rl.IsKeyPressed(.ENTER)) && skin_unlocked(&g, g.skin) {
 				reset_run(&g)
 				g.state = .Playing

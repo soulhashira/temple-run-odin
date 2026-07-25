@@ -18,6 +18,12 @@ BODY_C     :: rl.Color{226, 88, 58, 255}
 SKIN_C     :: rl.Color{243, 204, 168, 255}
 LIMB_C     :: rl.Color{62, 44, 40, 255}
 
+// Classic (Jungle Temple) daylight palette
+DAY_TOP    :: rl.Color{118, 178, 224, 255}
+DAY_BOTTOM :: rl.Color{208, 226, 202, 255}
+DAY_FOG    :: rl.Color{186, 202, 184, 255}
+RIDGE_C    :: rl.Color{168, 188, 158, 255}
+
 // --- Skins ---------------------------------------------------------------
 
 Hat_Kind :: enum {
@@ -210,6 +216,8 @@ Renderer :: struct {
 	tex_wood:  rl.Texture2D,
 	tex_white: rl.Texture2D,
 	tex_glow:  rl.Texture2D,
+	tex_path:  rl.Texture2D, // Classic: mossy slab path
+	tex_leaf:  rl.Texture2D, // Classic: foliage
 
 	mat_floor:  rl.Material,
 	mat_brick:  rl.Material,
@@ -219,6 +227,8 @@ Renderer :: struct {
 	mat_flat:   rl.Material, // lit, white texture, tinted per draw
 	mat_shadow: rl.Material, // unlit soft blob
 	mat_flame:  rl.Material, // unlit emissive bits
+	mat_path:   rl.Material,
+	mat_leaf:   rl.Material,
 
 	loc_view:        i32,
 	loc_light_count: i32,
@@ -241,6 +251,9 @@ Renderer :: struct {
 
 	last_step: int, // footstep phase tracker
 	dust_acc:  f32, // slide dust spawn accumulator
+
+	look:       Course, // course whose lighting uniforms are applied
+	look_valid: bool,
 }
 
 rd: Renderer
@@ -508,6 +521,76 @@ make_glow_texture :: proc() -> rl.Texture2D {
 	return tex_from_pixels(pix, W, W)
 }
 
+// Classic: big worn slabs, moss creeping in from the seams
+make_path_texture :: proc() -> rl.Texture2D {
+	W :: 256
+	H :: 256
+	COLS :: 4
+	ROWS :: 5
+	pix := make([]rl.Color, W*H)
+	defer delete(pix)
+	for y in 0 ..< H {
+		cy := y*ROWS/H
+		y0 := cy*H/ROWS
+		y1 := (cy + 1)*H/ROWS
+		off := cy % 2 == 0 ? 0 : W/COLS/2
+		for x in 0 ..< W {
+			xo := (x + off) % W
+			cx := xo*COLS/W
+			x0 := cx*W/COLS
+			x1 := (cx + 1)*W/COLS
+			edge := min(xo - x0, x1 - 1 - xo, y - y0, y1 - 1 - y)
+			n := fbm(f32(x)*0.05 + 300, f32(y)*0.05 + 120)
+			r, gc, b: f32
+			if edge < 2 {
+				m := 0.7 + 0.5*n
+				r = 42*m
+				gc = 44*m
+				b = 38*m
+			} else {
+				tb := 0.78 + 0.38*hash01(i32(cx)*7 + i32(cy)*31, 5)
+				br := (0.70 + 0.48*n)*tb
+				if edge < 5 do br *= 0.9
+				r = 118*br
+				gc = 121*br
+				b = 106*br
+				mo := vnoise(f32(x)*0.02 + 80, f32(y)*0.02 + 160)
+				if mo > 0.56 {
+					k := clamp((mo - 0.56)*2.6, 0, 0.6)
+					r = r*(1 - k) + 72*k
+					gc = gc*(1 - k) + 108*k
+					b = b*(1 - k) + 54*k
+				}
+			}
+			pix[y*W + x] = {u8(clamp(r, 0, 255)), u8(clamp(gc, 0, 255)), u8(clamp(b, 0, 255)), 255}
+		}
+	}
+	return tex_from_pixels(pix, W, H)
+}
+
+// Classic: mottled canopy green with sun flecks
+make_leaf_texture :: proc() -> rl.Texture2D {
+	W :: 128
+	pix := make([]rl.Color, W*W)
+	defer delete(pix)
+	for y in 0 ..< W {
+		for x in 0 ..< W {
+			n := fbm(f32(x)*0.09 + 500, f32(y)*0.09 + 40)
+			br := 0.55 + 0.6*n
+			r := 64*br
+			gc := 104*br
+			b := 50*br
+			if hash01(i32(x), i32(y)) > 0.985 {
+				r += 40
+				gc += 52
+				b += 20
+			}
+			pix[y*W + x] = {u8(clamp(r, 0, 255)), u8(clamp(gc, 0, 255)), u8(clamp(b, 0, 255)), 255}
+		}
+	}
+	return tex_from_pixels(pix, W, W)
+}
+
 // --- Init / shutdown -------------------------------------------------------
 
 shader_set3 :: proc(sh: rl.Shader, name: cstring, v: rl.Vector3) {
@@ -518,6 +601,24 @@ shader_set3 :: proc(sh: rl.Shader, name: cstring, v: rl.Vector3) {
 shader_set1 :: proc(sh: rl.Shader, name: cstring, f: f32) {
 	f := f
 	rl.SetShaderValue(sh, rl.GetShaderLocation(sh, name), &f, .FLOAT)
+}
+
+// per-course sun / ambient / fog; applied whenever the course changes
+apply_course_look :: proc(c: Course) {
+	switch c {
+	case .Ruins:
+		shader_set3(rd.shader, "ambientColor", {0.20, 0.19, 0.28})
+		shader_set3(rd.shader, "sunDir", norm3({-0.36, -0.88, -0.31}))
+		shader_set3(rd.shader, "sunColor", {0.33, 0.37, 0.52})
+		shader_set3(rd.shader, "fogColor", {f32(FOG.r)/255.0, f32(FOG.g)/255.0, f32(FOG.b)/255.0})
+		shader_set1(rd.shader, "fogDensity", 0.015)
+	case .Classic:
+		shader_set3(rd.shader, "ambientColor", {0.40, 0.42, 0.37})
+		shader_set3(rd.shader, "sunDir", norm3({-0.42, -0.78, -0.38}))
+		shader_set3(rd.shader, "sunColor", {0.95, 0.88, 0.68})
+		shader_set3(rd.shader, "fogColor", {f32(DAY_FOG.r)/255.0, f32(DAY_FOG.g)/255.0, f32(DAY_FOG.b)/255.0})
+		shader_set1(rd.shader, "fogDensity", 0.013)
+	}
 }
 
 lit_material :: proc(tex: rl.Texture2D) -> rl.Material {
@@ -541,12 +642,6 @@ init_renderer :: proc() {
 	rd.loc_light_col = rl.GetShaderLocation(rd.shader, "lightColor[0]")
 	rd.shader.locs[rl.ShaderLocationIndex.VECTOR_VIEW] = rd.loc_view
 
-	shader_set3(rd.shader, "ambientColor", {0.20, 0.19, 0.28})
-	shader_set3(rd.shader, "sunDir", norm3({-0.36, -0.88, -0.31}))
-	shader_set3(rd.shader, "sunColor", {0.33, 0.37, 0.52})
-	shader_set3(rd.shader, "fogColor", {f32(FOG.r)/255.0, f32(FOG.g)/255.0, f32(FOG.b)/255.0})
-	shader_set1(rd.shader, "fogDensity", 0.015)
-
 	rd.post = rl.LoadShaderFromMemory(nil, POST_FS)
 	rd.loc_ptime = rl.GetShaderLocation(rd.post, "time")
 	rd.loc_aberr = rl.GetShaderLocation(rd.post, "aberration")
@@ -569,6 +664,8 @@ init_renderer :: proc() {
 	rd.tex_wood = make_wood_texture()
 	rd.tex_white = make_white_texture()
 	rd.tex_glow = make_glow_texture()
+	rd.tex_path = make_path_texture()
+	rd.tex_leaf = make_leaf_texture()
 
 	rd.mat_floor = lit_material(rd.tex_floor)
 	rd.mat_brick = lit_material(rd.tex_brick)
@@ -578,6 +675,8 @@ init_renderer :: proc() {
 	rd.mat_flat = lit_material(rd.tex_white)
 	rd.mat_shadow = flat_material(rd.tex_glow)
 	rd.mat_flame = flat_material(rd.tex_white)
+	rd.mat_path = lit_material(rd.tex_path)
+	rd.mat_leaf = lit_material(rd.tex_leaf)
 
 	// blender-authored runner: skinned model + clips, lit by the scene shader
 	rd.runner = rl.LoadModel("assets/runner.glb")
@@ -623,6 +722,8 @@ shutdown_renderer :: proc() {
 	rl.UnloadTexture(rd.tex_wood)
 	rl.UnloadTexture(rd.tex_white)
 	rl.UnloadTexture(rd.tex_glow)
+	rl.UnloadTexture(rd.tex_path)
+	rl.UnloadTexture(rd.tex_leaf)
 	rl.UnloadRenderTexture(rd.rt)
 	rl.UnloadShader(rd.shader)
 	rl.UnloadShader(rd.post)
@@ -638,6 +739,7 @@ torch_flicker :: proc(t, seed: f32) -> f32 {
 collect_torches :: proc(g: ^Game) {
 	rd.torch_count = 0
 	rd.light_count = 0
+	if g.course != .Ruins do return // torches belong to the night course
 	poff := math.mod(g.distance, 12)
 	base_id := int(g.distance/12)
 	for i in 0 ..< 10 {
@@ -805,6 +907,10 @@ draw_particles :: proc() {
 // --- Sky ------------------------------------------------------------------------
 
 draw_sky :: proc(g: ^Game) {
+	if g.course == .Classic {
+		draw_sky_classic(g)
+		return
+	}
 	rl.DrawRectangleGradientV(0, 0, WIN_W, WIN_H, SKY_TOP, SKY_BOTTOM)
 	for s in rd.stars {
 		a := 0.35 + 0.65*(0.5 + 0.5*math.sin(g.time*s.speed + s.phase))
@@ -819,6 +925,39 @@ draw_sky :: proc(g: ^Game) {
 	rl.DrawCircle(mx - 12, my - 8, 7, {219, 210, 188, 255})
 	rl.DrawCircle(mx + 10, my + 11, 5, {223, 214, 192, 255})
 	rl.DrawCircle(mx + 16, my - 14, 4, {221, 212, 190, 255})
+}
+
+draw_sky_classic :: proc(g: ^Game) {
+	rl.DrawRectangleGradientV(0, 0, WIN_W, WIN_H, DAY_TOP, DAY_BOTTOM)
+
+	// sun with layered halo, on the side the shader sun comes from
+	sc := rl.Vector2{WIN_W - 310, 128}
+	rl.DrawCircleGradient(sc, 210, {255, 246, 205, 60}, {255, 246, 205, 0})
+	rl.DrawCircleGradient(sc, 100, {255, 250, 216, 110}, {255, 250, 216, 0})
+	rl.DrawCircleV(sc, 44, {255, 252, 228, 255})
+
+	// drifting cloud puffs
+	for i in 0 ..< 7 {
+		fi := i32(i)
+		w := f32(WIN_W) + 560
+		x := math.mod(hash01(fi, 57)*w + g.time*(5 + hash01(fi, 91)*9), w) - 280
+		y := 46 + hash01(fi, 23)*230
+		s := 34 + hash01(fi, 41)*40
+		a := 0.28 + hash01(fi, 67)*0.22
+		rl.DrawCircleGradient({x, y}, s*2.4, rl.Fade(rl.WHITE, a), rl.Fade(rl.WHITE, 0))
+		rl.DrawCircleGradient({x + s*1.5, y + s*0.25}, s*1.7, rl.Fade(rl.WHITE, a*0.9), rl.Fade(rl.WHITE, 0))
+		rl.DrawCircleGradient({x - s*1.4, y + s*0.30}, s*1.5, rl.Fade(rl.WHITE, a*0.8), rl.Fade(rl.WHITE, 0))
+	}
+
+	// hazy jungle ridge on the horizon
+	for i in 0 ..< 30 {
+		fi := i32(i)
+		x := f32(i)*(WIN_W/29.0)
+		r := 34 + hash01(fi, 7)*58
+		y := f32(WIN_H)*0.47 + hash01(fi, 13)*26
+		rl.DrawCircleV({x, y}, r, RIDGE_C)
+	}
+	rl.DrawRectangle(0, WIN_H*47/100 + 24, WIN_W, WIN_H, RIDGE_C)
 }
 
 // --- 3D scene ---------------------------------------------------------------------
@@ -845,6 +984,65 @@ draw_box :: proc(m: ^rl.Material, center, size: rl.Vector3, tint: rl.Color = rl.
 }
 
 draw_track :: proc(g: ^Game) {
+	switch g.course {
+	case .Ruins:
+		draw_track_ruins(g)
+	case .Classic:
+		draw_track_classic(g)
+	}
+}
+
+// a box along z, cut open wherever a pit gap overlaps it
+draw_floor_span :: proc(m: ^rl.Material, g: ^Game, zf, zn, x, y, w, h: f32, tint: rl.Color) {
+	segs: [6][2]f32
+	n := 1
+	segs[0] = {zf, zn}
+	for gp in g.gaps {
+		gf := gp.z - gp.half
+		gn := gp.z + gp.half
+		i := 0
+		for i < n {
+			s := segs[i]
+			if gf >= s[1] || gn <= s[0] {
+				i += 1
+				continue
+			}
+			n -= 1
+			segs[i] = segs[n]
+			if s[0] < gf && n < len(segs) {
+				segs[n] = {s[0], gf}
+				n += 1
+			}
+			if gn < s[1] && n < len(segs) {
+				segs[n] = {gn, s[1]}
+				n += 1
+			}
+		}
+	}
+	for i in 0 ..< n {
+		s := segs[i]
+		if s[1] - s[0] < 0.04 do continue
+		draw_box(m, {x, y, (s[0] + s[1])*0.5}, {w, h, s[1] - s[0]}, tint)
+	}
+}
+
+draw_pits :: proc(g: ^Game) {
+	w := TRACK_HALF*2 + 0.4
+	for gp in g.gaps {
+		zf := gp.z - gp.half
+		zn := gp.z + gp.half
+		draw_box(&rd.mat_stone, {0, -2.30, gp.z}, {w, 0.3, gp.half*2 + 0.8}, {24, 22, 18, 255})         // bottom
+		draw_box(&rd.mat_stone, {0, -1.12, zf - 0.2}, {w, 2.05, 0.4}, {92, 86, 70, 255})                // far wall
+		draw_box(&rd.mat_stone, {0, -1.12, zn + 0.2}, {w, 2.05, 0.4}, {62, 58, 48, 255})                // near wall
+		draw_box(&rd.mat_stone, {-(w/2 - 0.2), -1.12, gp.z}, {0.4, 2.05, gp.half*2}, {74, 70, 58, 255}) // sides
+		draw_box(&rd.mat_stone, {+(w/2 - 0.2), -1.12, gp.z}, {0.4, 2.05, gp.half*2}, {74, 70, 58, 255})
+		// crumbled lip stones
+		draw_box(&rd.mat_stone, {-TRACK_HALF*0.5, 0.05, zf - 0.12}, {1.4, 0.1, 0.28}, {152, 152, 130, 255})
+		draw_box(&rd.mat_stone, {TRACK_HALF*0.6, 0.05, zn + 0.12}, {1.7, 0.1, 0.28}, {152, 152, 130, 255})
+	}
+}
+
+draw_track_ruins :: proc(g: ^Game) {
 	offset := math.mod(g.distance, 8)
 	for i in 0 ..< 30 {
 		zc := 8.0 + offset - f32(i)*4.0 - 2.0
@@ -866,6 +1064,72 @@ draw_track :: proc(g: ^Game) {
 			x := sx*(TRACK_HALF + 1.35)
 			draw_box(&rd.mat_stone, {x, 2.1, z}, {1.3, 4.2, 1.3})
 			draw_box(&rd.mat_stone, {x, 4.45, z}, {1.7, 0.5, 1.7}, {214, 206, 190, 255})
+		}
+	}
+}
+
+draw_track_classic :: proc(g: ^Game) {
+	w := TRACK_HALF*2 + 0.4
+	offset := math.mod(g.distance, 8)
+	for i in 0 ..< 30 {
+		zc := 8.0 + offset - f32(i)*4.0 - 2.0
+		tint := i % 2 == 0 ? rl.Color{255, 255, 255, 255} : rl.Color{230, 226, 212, 255}
+		draw_floor_span(&rd.mat_path, g, zc - 2, zc + 2, 0, -0.1, w, 0.2, tint)
+		// jungle floor shoulders
+		draw_box(&rd.mat_leaf, {-(TRACK_HALF + 4.2), -0.30, zc}, {8.0, 0.3, 4.0}, {148, 164, 126, 255})
+		draw_box(&rd.mat_leaf, {+(TRACK_HALF + 4.2), -0.30, zc}, {8.0, 0.3, 4.0}, {148, 164, 126, 255})
+	}
+	draw_pits(g)
+
+	// worn lane grooves (also cut by the pits)
+	draw_floor_span(&rd.mat_flat, g, -122, 8, -LANE_WIDTH/2, 0.02, 0.06, 0.03, {118, 121, 104, 255})
+	draw_floor_span(&rd.mat_flat, g, -122, 8, +LANE_WIDTH/2, 0.02, 0.06, 0.03, {118, 121, 104, 255})
+
+	// jungle decorations, anchored to world distance so they stream past
+	poff := math.mod(g.distance, 6)
+	base_id := int(g.distance/6)
+	for i in 0 ..< 23 {
+		z := 8.0 + poff - f32(i)*6.0
+		id := base_id + i
+		for side in ([?]f32{-1, 1}) {
+			s := i32(id)*2 + (side > 0 ? 1 : 0)
+			h1 := hash01(s, 3)
+			h2 := hash01(s, 17)
+			h3 := hash01(s, 29)
+			h4 := hash01(s, 43)
+
+			// crumbling curb wall, some chunks missing
+			if h4 > 0.3 {
+				draw_box(&rd.mat_stone, {side*(TRACK_HALF + 0.55), 0.26 + h2*0.14, z}, {0.7, 0.52 + h2*0.3, 5.2}, {174, 176, 152, 255})
+			}
+
+			// tree: trunk + canopy blobs
+			tx := side*(TRACK_HALF + 2.4 + h1*3.4)
+			tz := z + (h3 - 0.5)*4.0
+			th := 3.8 + h2*2.8
+			tr := 0.26 + h3*0.16
+			rd.mat_wood.maps[0].color = {118, 92, 62, 255}
+			rl.DrawMesh(rd.mesh_cyl, rd.mat_wood, mat_translate(tx, -0.2, tz)*mat_scale(tr, th, tr))
+			rc := 1.3 + h2*0.9
+			rd.mat_leaf.maps[0].color = {58 + u8(h1*36), 96 + u8(h2*40), 48 + u8(h3*20), 255}
+			rl.DrawMesh(rd.mesh_sphere, rd.mat_leaf, mat_ts({tx, th - 0.3 + rc*0.5, tz}, {rc, rc*0.8, rc}))
+			rd.mat_leaf.maps[0].color = {50 + u8(h3*30), 88 + u8(h1*36), 44 + u8(h2*18), 255}
+			rl.DrawMesh(rd.mesh_sphere, rd.mat_leaf, mat_ts({tx + side*rc*0.55, th - 0.6 + rc*0.35, tz + 0.4}, {rc*0.7, rc*0.55, rc*0.7}))
+
+			// fern near the path edge
+			if h3 > 0.35 {
+				rd.mat_leaf.maps[0].color = {74, 118, 58, 255}
+				rl.DrawMesh(rd.mesh_sphere, rd.mat_leaf, mat_ts({side*(TRACK_HALF + 1.15 + h1*0.8), 0.18, z + (h2 - 0.5)*3}, {0.55, 0.3, 0.55}))
+			}
+		}
+		// mossy pillar stump now and then
+		if id % 6 == 0 {
+			hp := hash01(i32(id), 77)
+			ps: f32 = hp > 0.5 ? 1 : -1
+			px := ps*(TRACK_HALF + 1.7)
+			rd.mat_stone.maps[0].color = rl.WHITE
+			rl.DrawMesh(rd.mesh_cyl, rd.mat_stone, mat_translate(px, 0, z)*mat_scale(0.42, 1.5 + hp*1.2, 0.42))
+			draw_box(&rd.mat_stone, {px, 1.6 + hp*1.2, z}, {1.05, 0.3, 1.05}, {186, 188, 164, 255})
 		}
 	}
 }
@@ -899,8 +1163,70 @@ draw_torch_glows :: proc() {
 	rl.EndBlendMode()
 }
 
-draw_obstacle :: proc(ob: Obstacle) {
+// gate fire glow for the Classic course's slide-under obstacle
+draw_flame_glows :: proc(g: ^Game) {
+	if g.course != .Classic do return
+	rl.BeginBlendMode(.ADDITIVE)
+	for ob in g.obstacles {
+		if ob.kind != .High do continue
+		x := f32(ob.lane)*LANE_WIDTH
+		for k in -1 ..= 1 {
+			fx := x + f32(k)*0.78
+			fl := torch_flicker(g.time, fx*1.9 + 7.0)
+			rl.DrawBillboard(rd.cam, rd.tex_glow, {fx, 1.35, ob.z + 0.35}, 0.9*fl, rl.Fade({255, 150, 60, 255}, 0.4*fl))
+		}
+	}
+	rl.EndBlendMode()
+}
+
+draw_obstacle :: proc(g: ^Game, ob: Obstacle) {
 	x := f32(ob.lane)*LANE_WIDTH
+	if g.course == .Classic {
+		switch ob.kind {
+		case .Low:
+			// fallen mossy log: jump it
+			rd.mat_wood.maps[0].color = {132, 100, 68, 255}
+			rl.DrawMesh(rd.mesh_cyl, rd.mat_wood, mat_translate(x - 1.25, 0.52, ob.z)*mat_rot_z(-math.PI/2)*mat_scale(0.42, 2.5, 0.42))
+			// snapped root stubs
+			rd.mat_wood.maps[0].color = {104, 78, 52, 255}
+			rl.DrawMesh(rd.mesh_cyl, rd.mat_wood, mat_translate(x - 0.95, 0.80, ob.z)*mat_rot_z(0.5)*mat_scale(0.10, 0.55, 0.10))
+			rl.DrawMesh(rd.mesh_cyl, rd.mat_wood, mat_translate(x + 0.85, 0.86, ob.z)*mat_rot_z(-0.35)*mat_scale(0.12, 0.48, 0.12))
+			// moss clumps
+			rd.mat_leaf.maps[0].color = {96, 132, 74, 255}
+			rl.DrawMesh(rd.mesh_sphere, rd.mat_leaf, mat_ts({x - 0.35, 0.88, ob.z}, {0.34, 0.18, 0.36}))
+			rl.DrawMesh(rd.mesh_sphere, rd.mat_leaf, mat_ts({x + 0.45, 0.84, ob.z + 0.1}, {0.28, 0.15, 0.30}))
+		case .High:
+			// stone gate with fire under the lintel: slide
+			draw_box(&rd.mat_stone, {x - 1.2, 1.7, ob.z}, {0.42, 3.4, 0.62}, {166, 168, 142, 255})
+			draw_box(&rd.mat_stone, {x + 1.2, 1.7, ob.z}, {0.42, 3.4, 0.62}, {166, 168, 142, 255})
+			draw_box(&rd.mat_stone, {x, 2.42, ob.z}, {2.6, 1.95, 0.55}, {182, 176, 148, 255})
+			draw_box(&rd.mat_stone, {x, 3.52, ob.z}, {2.95, 0.35, 0.85}, {196, 190, 158, 255})
+			for k in -1 ..= 1 {
+				fx := x + f32(k)*0.78
+				fl := torch_flicker(g.time, fx*1.9 + 7.0)
+				sway := math.sin(g.time*7.1 + fx*2.3)*0.05
+				s := 0.13 + 0.06*fl
+				rd.mat_flame.maps[0].color = {255, 138, 36, 255}
+				rl.DrawMesh(rd.mesh_sphere, rd.mat_flame, mat_translate(fx + sway, 1.30, ob.z)*mat_scale(s, s*2.0, s))
+				rd.mat_flame.maps[0].color = {255, 226, 120, 255}
+				rl.DrawMesh(rd.mesh_sphere, rd.mat_flame, mat_translate(fx + sway, 1.34, ob.z)*mat_scale(s*0.55, s*1.2, s*0.55))
+			}
+		case .Block:
+			// mossy ruin wall: change lanes
+			draw_box(&rd.mat_stone, {x, 1.7, ob.z}, {2.6, 3.4, 1.0}, {162, 162, 138, 255})
+			draw_box(&rd.mat_stone, {x - 0.65, 3.55, ob.z}, {1.05, 0.55, 1.05}, {176, 174, 150, 255})
+			draw_box(&rd.mat_stone, {x + 0.85, 3.32, ob.z}, {0.72, 0.34, 1.05}, {152, 150, 128, 255})
+			// vines down the face, moss on top
+			draw_box(&rd.mat_flat, {x - 0.45, 2.3, ob.z + 0.53}, {0.16, 2.2, 0.05}, {86, 124, 66, 255})
+			draw_box(&rd.mat_flat, {x + 0.62, 2.6, ob.z + 0.53}, {0.13, 1.6, 0.05}, {74, 112, 58, 255})
+			rd.mat_leaf.maps[0].color = {96, 132, 74, 255}
+			rl.DrawMesh(rd.mesh_sphere, rd.mat_leaf, mat_ts({x + 0.1, 3.45, ob.z + 0.2}, {0.7, 0.3, 0.55}))
+			// rubble at the base
+			draw_box(&rd.mat_stone, {x - 0.95, 0.24, ob.z + 0.72}, {0.66, 0.48, 0.55}, {146, 144, 122, 255})
+			draw_box(&rd.mat_stone, {x + 0.75, 0.16, ob.z + 0.66}, {0.5, 0.32, 0.5}, {134, 132, 112, 255})
+		}
+		return
+	}
 	switch ob.kind {
 	case .Low:
 		draw_box(&rd.mat_wood, {x, 0.475, ob.z}, {2.5, 0.95, 0.5})
@@ -917,7 +1243,7 @@ draw_obstacle :: proc(ob: Obstacle) {
 }
 
 draw_coin_mesh :: proc(g: ^Game, c: Coin) {
-	y := c.pulled ? c.y : (1.0 + math.sin(g.time*4 + c.z*0.5)*0.12)
+	y := c.pulled ? c.y : (c.y + math.sin(g.time*4 + c.z*0.5)*0.12)
 	spin := g.time*3.5 + c.z*0.7
 	rd.mat_gold.maps[0].color = GOLD
 	m := mat_translate(c.x, y, c.z)*mat_rot_y(spin)*mat_rot_x(math.PI/2)*mat_scale(0.34, 0.10, 0.34)*mat_translate(0, -0.5, 0)
@@ -927,7 +1253,7 @@ draw_coin_mesh :: proc(g: ^Game, c: Coin) {
 draw_coin_glows :: proc(g: ^Game) {
 	rl.BeginBlendMode(.ADDITIVE)
 	for c in g.coins {
-		y := c.pulled ? c.y : (1.0 + math.sin(g.time*4 + c.z*0.5)*0.12)
+		y := c.pulled ? c.y : (c.y + math.sin(g.time*4 + c.z*0.5)*0.12)
 		pulse := 0.75 + 0.25*math.sin(g.time*6 + c.z)
 		rl.DrawBillboard(rd.cam, rd.tex_glow, {c.x, y, c.z}, 0.85*pulse, rl.Fade({255, 190, 60, 255}, 0.22*pulse))
 	}
@@ -1036,9 +1362,11 @@ draw_player :: proc(g: ^Game) {
 	accent := sk.accent
 
 	// soft blob shadow
-	ss := clamp(0.95/(1 + p.y*0.35), 0.3, 1.0)
-	rd.mat_shadow.maps[0].color = {0, 0, 0, u8(150.0*ss)}
-	rl.DrawMesh(rd.mesh_plane, rd.mat_shadow, mat_translate(p.x, 0.02, 0)*mat_scale(1.5*ss + 0.4, 1, 1.2*ss + 0.3))
+	if p.y > -0.05 { // no blob shadow once you've dropped into a pit
+		ss := clamp(0.95/(1 + p.y*0.35), 0.3, 1.0)
+		rd.mat_shadow.maps[0].color = {0, 0, 0, u8(150.0*ss)}
+		rl.DrawMesh(rd.mesh_plane, rd.mat_shadow, mat_translate(p.x, 0.02, 0)*mat_scale(1.5*ss + 0.4, 1, 1.2*ss + 0.3))
+	}
 
 	// lean into lane changes, slight tilt in the air
 	lean := clamp((f32(p.lane)*LANE_WIDTH - p.x)*-0.14, -0.4, 0.4)
@@ -1126,7 +1454,7 @@ draw_player_aura :: proc(g: ^Game) {
 
 update_effects :: proc(g: ^Game, dt: f32) {
 	p := g.player
-	grounded := p.y <= 0.01
+	grounded := p.y <= 0.01 && p.y > -0.05
 
 	// footstep dust: one half sine period per footfall
 	step := int(g.distance*2.2/math.PI)
@@ -1152,18 +1480,23 @@ update_effects :: proc(g: ^Game, dt: f32) {
 // --- Frame composition ----------------------------------------------------------------
 
 draw_world :: proc(g: ^Game) {
+	if !rd.look_valid || rd.look != g.course {
+		rd.look = g.course
+		rd.look_valid = true
+		apply_course_look(g.course)
+	}
 	collect_torches(g)
 	rd.cam = make_camera(g)
 	apply_frame_uniforms()
 
 	rl.BeginTextureMode(rd.rt)
-	rl.ClearBackground(SKY_TOP) // also clears the depth buffer — required for 3D
+	rl.ClearBackground(g.course == .Classic ? DAY_TOP : SKY_TOP) // also clears the depth buffer — required for 3D
 	draw_sky(g)
 
 	rl.BeginMode3D(rd.cam)
 	draw_track(g)
 	draw_torches(g)
-	for ob in g.obstacles do draw_obstacle(ob)
+	for ob in g.obstacles do draw_obstacle(g, ob)
 	for c in g.coins do draw_coin_mesh(g, c)
 	for pu in g.powerups do draw_powerup(g, pu)
 	draw_player(g)
@@ -1172,6 +1505,7 @@ draw_world :: proc(g: ^Game) {
 	draw_powerup_glows(g)
 	draw_player_aura(g)
 	draw_torch_glows()
+	draw_flame_glows(g)
 	rl.EndMode3D()
 	rl.EndTextureMode()
 
