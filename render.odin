@@ -1,5 +1,6 @@
 // render.odin — all drawing for the temple run clone:
 // per-pixel lighting shader, procedural textures, mesh pipeline,
+// the blender-authored runner (assets/runner.glb, see assets/build_runner.py),
 // torches, particles, sky, and the post-processing pass.
 package temple_run
 
@@ -193,6 +194,15 @@ Renderer :: struct {
 	mesh_cyl:    rl.Mesh,
 	mesh_plane:  rl.Mesh,
 	mesh_torus:  rl.Mesh,
+
+	runner:            rl.Model, // blender-authored player (assets/runner.glb)
+	runner_anims:      [^]rl.ModelAnimation,
+	runner_anim_count: i32,
+	clip_idle:         i32,
+	clip_run:          i32,
+	clip_jump:         i32,
+	clip_slide:        i32,
+	head_bone:         i32, // hat attachment point
 
 	tex_floor: rl.Texture2D,
 	tex_brick: rl.Texture2D,
@@ -569,6 +579,25 @@ init_renderer :: proc() {
 	rd.mat_shadow = flat_material(rd.tex_glow)
 	rd.mat_flame = flat_material(rd.tex_white)
 
+	// blender-authored runner: skinned model + clips, lit by the scene shader
+	rd.runner = rl.LoadModel("assets/runner.glb")
+	if rd.runner.meshCount == 0 {
+		rl.TraceLog(.FATAL, "assets/runner.glb missing - regenerate: blender --background --python assets/build_runner.py")
+	}
+	for i in 0 ..< rd.runner.materialCount {
+		rd.runner.materials[i].shader = rd.shader
+	}
+	rd.runner_anims = rl.LoadModelAnimations("assets/runner.glb", &rd.runner_anim_count)
+	rd.clip_idle = find_clip("idle")
+	rd.clip_run = find_clip("run")
+	rd.clip_jump = find_clip("jump")
+	rd.clip_slide = find_clip("slide")
+	rd.head_bone = -1
+	for i in 0 ..< rd.runner.skeleton.boneCount {
+		b := &rd.runner.skeleton.bones[i]
+		if string(cstring(raw_data(b.name[:]))) == "head" do rd.head_bone = i
+	}
+
 	for i in 0 ..< STAR_COUNT {
 		rd.stars[i] = {
 			x     = hash01(i32(i), 11)*WIN_W,
@@ -586,6 +615,8 @@ shutdown_renderer :: proc() {
 	rl.UnloadMesh(rd.mesh_cyl)
 	rl.UnloadMesh(rd.mesh_plane)
 	rl.UnloadMesh(rd.mesh_torus)
+	rl.UnloadModelAnimations(rd.runner_anims, rd.runner_anim_count)
+	rl.UnloadModel(rd.runner)
 	rl.UnloadTexture(rd.tex_floor)
 	rl.UnloadTexture(rd.tex_brick)
 	rl.UnloadTexture(rd.tex_stone)
@@ -953,12 +984,6 @@ draw_powerup_glows :: proc(g: ^Game) {
 	rl.EndBlendMode()
 }
 
-// segment lengths for the articulated runner
-THIGH_LEN :: f32(0.42)
-SHIN_LEN  :: f32(0.40)
-UARM_LEN  :: f32(0.33)
-FARM_LEN  :: f32(0.31)
-
 mix_c :: proc(a, b: rl.Color, t: f32) -> rl.Color {
 	return {
 		u8(f32(a.r) + (f32(b.r) - f32(a.r))*t),
@@ -974,26 +999,24 @@ player_part :: proc(mesh: rl.Mesh, base: rl.Matrix, off, size: rl.Vector3, tint:
 	rl.DrawMesh(mesh, rd.mat_flat, base*mat_ts(off, size))
 }
 
-// box segment hanging down from a joint
-player_seg :: proc(joint: rl.Matrix, length, thick: f32, tint: rl.Color) {
-	player_part(rd.mesh_cube, joint, {0, -length*0.5, 0}, {thick, length, thick}, tint)
+// raylib loads glTF materials after its default material at index 0. File
+// order follows the Blender object-join order in assets/build_runner.py:
+// hips(pants), torso(body), sash(accent), skull(skin), eyes(dark).
+RMAT_PANTS  :: 1
+RMAT_BODY   :: 2
+RMAT_ACCENT :: 3
+RMAT_SKIN   :: 4
+
+find_clip :: proc(name: string) -> i32 {
+	for i in 0 ..< rd.runner_anim_count {
+		a := &rd.runner_anims[i]
+		if string(cstring(raw_data(a.name[:]))) == name do return i
+	}
+	return 0
 }
 
-player_leg :: proc(base: rl.Matrix, x, hip_y, hip, knee: f32, pants, boot: rl.Color) {
-	hip_m := base*mat_translate(x, hip_y, 0)*mat_rot_x(hip)
-	player_seg(hip_m, THIGH_LEN, 0.21, pants)
-	knee_m := hip_m*mat_translate(0, -THIGH_LEN, 0)*mat_rot_x(knee)
-	player_seg(knee_m, SHIN_LEN, 0.17, pants)
-	player_part(rd.mesh_cube, knee_m*mat_translate(0, -SHIN_LEN, 0), {0, 0.05, -0.07}, {0.19, 0.11, 0.30}, boot)
-}
-
-player_arm :: proc(torso_m: rl.Matrix, x, sh, el: f32, sleeve, hand: rl.Color) {
-	out: f32 = x < 0 ? -0.10 : 0.10
-	sh_m := torso_m*mat_translate(x, 0.58, 0)*mat_rot_z(out)*mat_rot_x(sh)
-	player_seg(sh_m, UARM_LEN, 0.14, sleeve)
-	el_m := sh_m*mat_translate(0, -UARM_LEN, 0)*mat_rot_x(el)
-	player_seg(el_m, FARM_LEN, 0.115, hand)
-	player_part(rd.mesh_cube, el_m*mat_translate(0, -FARM_LEN, 0), {0, -0.03, 0}, {0.13, 0.13, 0.13}, hand)
+clip_len :: proc(clip: i32) -> f32 {
+	return f32(rd.runner_anims[clip].keyframeCount - 1)
 }
 
 draw_player :: proc(g: ^Game) {
@@ -1001,7 +1024,6 @@ draw_player :: proc(g: ^Game) {
 	sk := SKINS[g.skin]
 	grounded := p.y <= 0.01
 	phase := g.distance*2.2
-	speed_n := clamp((g.speed - BASE_SPEED)/(MAX_SPEED - BASE_SPEED), 0, 1)
 
 	bob: f32
 	if grounded && !p.sliding && g.state == .Playing do bob = abs(math.sin(phase))*0.09
@@ -1025,87 +1047,56 @@ draw_player :: proc(g: ^Game) {
 	if g.state == .Menu do base = base*mat_rot_y(math.PI + g.time*0.9)    // skin-select turntable
 	if dead do base = base*mat_rot_x(clamp(g.death_timer*3.2, 0, 1.45)) // face-plant
 
-	// --- pose --------------------------------------------------------
-	hip_l, knee_l, hip_r, knee_r: f32
-	sh_l, el_l, sh_r, el_r: f32
-	twist, tlean: f32
-	pelvis_y := f32(0.86)
-
-	if p.sliding {
-		pelvis_y = 0.34
-		tlean = -1.15 // recline for the baseball slide
-		hip_l, knee_l = 1.35, -0.20
-		hip_r, knee_r = 1.05, -0.85
-		sh_l, el_l = -1.9, 0.4
-		sh_r, el_r = 0.9, 1.2
-		twist = 0.15
-	} else if !grounded {
+	// --- clip selection: run scrubbed by distance, jump by velocity ------
+	clip := rd.clip_run
+	frame: f32
+	switch {
+	case g.state == .Menu:
+		clip = rd.clip_idle
+		frame = math.mod(g.time*60, clip_len(rd.clip_idle))
+	case p.sliding:
+		clip = rd.clip_slide
+		frame = math.mod(g.time*60, clip_len(rd.clip_slide))
+	case !grounded:
+		clip = rd.clip_jump
 		tuck := clamp(p.vy*0.05 + 0.55, 0, 1) // rising -> tucked, falling -> extended
-		hip_l = 0.45 + 1.05*tuck
-		knee_l = -(0.45 + 1.45*tuck)
-		hip_r = -0.15 + 0.55*tuck
-		knee_r = -(0.55 + 0.75*tuck)
-		sh_l = -0.2 - 0.9*tuck
-		el_l = 0.9
-		sh_r = 0.3 + 0.7*tuck
-		el_r = 1.3
-		tlean = 0.10
-	} else if g.state == .Menu {
-		hip_l, knee_l = 0.04, -0.10
-		hip_r, knee_r = -0.04, -0.10
-		sh_l, el_l = 0.06, 0.25
-		sh_r, el_r = -0.06, 0.25
-		tlean = 0.03 + math.sin(g.time*2.4)*0.03 // breathing
-	} else {
-		hip_l = math.sin(phase)*0.85
-		hip_r = -hip_l
-		knee_l = -(0.15 + 1.55*max(math.cos(phase - 4.9), 0))
-		knee_r = -(0.15 + 1.55*max(math.cos(phase + math.PI - 4.9), 0))
-		sh_l = -math.sin(phase)*0.75
-		sh_r = -sh_l
-		el_l = 1.05 + 0.25*clamp(-math.sin(phase), 0, 1)
-		el_r = 1.05 + 0.25*clamp(math.sin(phase), 0, 1)
-		twist = math.sin(phase)*0.13
-		tlean = 0.14 + 0.10*speed_n
+		frame = (1 - tuck)*clip_len(rd.clip_jump)
+	case:
+		frame = math.mod(phase/(2*math.PI)*clip_len(rd.clip_run), clip_len(rd.clip_run))
 	}
+	rl.UpdateModelAnimation(rd.runner, rd.runner_anims[clip], frame)
 
-	// --- build ---------------------------------------------------------
-	player_part(rd.mesh_cube, base, {0, pelvis_y - 0.02, 0}, {0.46, 0.24, 0.32}, pants)
-	player_leg(base, -0.15, pelvis_y - 0.10, hip_l, knee_l, pants, accent)
-	player_leg(base, +0.15, pelvis_y - 0.10, hip_r, knee_r, pants, accent)
+	// per-skin palette
+	rd.runner.materials[RMAT_BODY].maps[0].color = body
+	rd.runner.materials[RMAT_PANTS].maps[0].color = pants
+	rd.runner.materials[RMAT_SKIN].maps[0].color = flesh
+	rd.runner.materials[RMAT_ACCENT].maps[0].color = accent
 
-	torso_m := base*mat_translate(0, pelvis_y + 0.06, 0)*mat_rot_y(twist)*mat_rot_x(tlean)
-	player_part(rd.mesh_cube, torso_m, {0, 0.32, 0}, {0.56, 0.60, 0.34}, body)
-	player_part(rd.mesh_cube, torso_m, {0, 0.34, -0.185}, {0.42, 0.14, 0.02}, accent) // chest sash
+	rd.runner.transform = base
+	rl.DrawModel(rd.runner, {0, 0, 0}, 1, rl.WHITE)
 
-	player_arm(torso_m, -0.36, sh_l, el_l, body, flesh)
-	player_arm(torso_m, +0.36, sh_r, el_r, body, flesh)
-
-	// --- head & hat ------------------------------------------------------
-	head_m := torso_m*mat_translate(0, 0.62, 0)*mat_rot_x(-tlean*0.6)
-	head_z: f32 = sk.hat == .Hood ? -0.05 : 0
-	player_part(rd.mesh_sphere, head_m, {0, 0.16, head_z}, {0.22, 0.24, 0.22}, flesh)
-	eye := rl.Color{34, 28, 32, 255}
-	player_part(rd.mesh_cube, head_m, {-0.08, 0.19, head_z - 0.185}, {0.05, 0.05, 0.03}, eye)
-	player_part(rd.mesh_cube, head_m, {+0.08, 0.19, head_z - 0.185}, {0.05, 0.05, 0.03}, eye)
+	// --- hat rides the head bone ------------------------------------------
+	if rd.head_bone < 0 do return
+	tf := rd.runner.currentPose[rd.head_bone]
+	head_m := base*mat_translate(tf.translation.x, tf.translation.y, tf.translation.z)*rl.QuaternionToMatrix(tf.rotation)
 
 	switch sk.hat {
 	case .None:
 	case .Headband:
 		rd.mat_flat.maps[0].color = accent
-		rl.DrawMesh(rd.mesh_cyl, rd.mat_flat, head_m*mat_translate(0, 0.22, 0)*mat_scale(0.235, 0.08, 0.235)*mat_translate(0, -0.5, 0))
+		rl.DrawMesh(rd.mesh_cyl, rd.mat_flat, head_m*mat_translate(0, 0.31, 0)*mat_scale(0.235, 0.08, 0.235)*mat_translate(0, -0.5, 0))
 	case .Cap:
-		player_part(rd.mesh_sphere, head_m, {0, 0.31, 0.02}, {0.225, 0.13, 0.225}, accent)
-		player_part(rd.mesh_cube, head_m, {0, 0.28, -0.27}, {0.30, 0.045, 0.24}, accent)
+		player_part(rd.mesh_sphere, head_m, {0, 0.40, 0.02}, {0.225, 0.13, 0.225}, accent)
+		player_part(rd.mesh_cube, head_m, {0, 0.37, -0.27}, {0.30, 0.045, 0.24}, accent)
 	case .Crown:
 		rd.mat_flat.maps[0].color = accent
-		rl.DrawMesh(rd.mesh_cyl, rd.mat_flat, head_m*mat_translate(0, 0.40, 0)*mat_scale(0.185, 0.12, 0.185)*mat_translate(0, -0.5, 0))
-		player_part(rd.mesh_cube, head_m, {0, 0.46, -0.16}, {0.055, 0.10, 0.055}, accent)
-		player_part(rd.mesh_cube, head_m, {-0.14, 0.46, 0.08}, {0.055, 0.10, 0.055}, accent)
-		player_part(rd.mesh_cube, head_m, {+0.14, 0.46, 0.08}, {0.055, 0.10, 0.055}, accent)
+		rl.DrawMesh(rd.mesh_cyl, rd.mat_flat, head_m*mat_translate(0, 0.49, 0)*mat_scale(0.185, 0.12, 0.185)*mat_translate(0, -0.5, 0))
+		player_part(rd.mesh_cube, head_m, {0, 0.55, -0.16}, {0.055, 0.10, 0.055}, accent)
+		player_part(rd.mesh_cube, head_m, {-0.14, 0.55, 0.08}, {0.055, 0.10, 0.055}, accent)
+		player_part(rd.mesh_cube, head_m, {+0.14, 0.55, 0.08}, {0.055, 0.10, 0.055}, accent)
 	case .Hood:
-		player_part(rd.mesh_sphere, head_m, {0, 0.17, 0.05}, {0.26, 0.27, 0.26}, pants)
-		player_part(rd.mesh_cube, head_m, {0, -0.06, 0.02}, {0.34, 0.16, 0.30}, pants) // cowl
+		player_part(rd.mesh_sphere, head_m, {0, 0.26, 0.05}, {0.26, 0.27, 0.26}, pants)
+		player_part(rd.mesh_cube, head_m, {0, 0.03, 0.02}, {0.34, 0.16, 0.30}, pants) // cowl
 	}
 }
 
